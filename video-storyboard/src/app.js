@@ -194,18 +194,27 @@ export class App {
   // ---------- 取帧 ----------
 
   async ensurePointFrame(point) {
+    // 失去覆盖的点（sourceTime 已被时间轴清空）不取帧：
+    // 任何旧源时间都不再对应该点，取回的帧必然是过期画面。
+    if (point.sourceTime == null) return;
     const track = this.timeline.getTrack(point.trackId);
     const entry = this.files.get(point.trackId);
     if (!track || !entry) return;
 
-    point.frameKey = frameKeyFor(entry.digest.hex, point.sourceTime);
+    // 取帧代次：同一点并发/交错的多次取帧，只有最新一次允许提交。
+    // 否则“编辑前的缓存结果晚到”会在新一次调用把状态重置为 loading
+    // 之后通过校验，让旧源时间的帧覆盖新映射。
+    const fetchId = (point._fetchId = (point._fetchId ?? 0) + 1);
+    const sourceTime = point.sourceTime; // 本次调用锁定的源时间
+    point.frameKey = frameKeyFor(entry.digest.hex, sourceTime);
     point.frameStatus = "loading";
     this.emit();
 
     // 1) 先查本地缓存：内容相同（摘要一致）+ 同一源时间才命中
     try {
       const cached = await this.cache.get(point.frameKey);
-      if (cached && this._isCurrentPoint(point)) {
+      if (cached) {
+        if (!this._isCurrentFetch(point, fetchId, sourceTime)) return;
         this._adoptFrame(point, cached, true);
         return;
       }
@@ -217,10 +226,14 @@ export class App {
     const res = await this.extractor.capture(point.id, {
       trackId: point.trackId,
       url: entry.url,
-      sourceTime: point.sourceTime,
+      sourceTime,
     });
 
-    if (res.status === "stale" || !this._isCurrentPoint(point)) return;
+    if (
+      res.status === "stale" ||
+      !this._isCurrentFetch(point, fetchId, sourceTime)
+    )
+      return;
     if (res.status === "error") {
       point.frameStatus = "error";
       this.emit();
@@ -232,9 +245,18 @@ export class App {
     this.cache.put(point.frameKey, res.blob).catch(() => {});
   }
 
-  _isCurrentPoint(point) {
+  /**
+   * 本次取帧调用是否仍是该点的最新一次：
+   * 点存活、代次未被淘汰、状态仍为 loading 且源时间未被重解析改变。
+   */
+  _isCurrentFetch(point, fetchId, sourceTime) {
     const live = this.timeline.points.find((p) => p.id === point.id);
-    return live === point && live.frameStatus === "loading";
+    return (
+      live === point &&
+      point._fetchId === fetchId &&
+      point.frameStatus === "loading" &&
+      point.sourceTime === sourceTime
+    );
   }
 
   _adoptFrame(point, blob, fromCache) {
@@ -246,11 +268,16 @@ export class App {
     this.emit();
   }
 
-  /** 为所有 stale/idle/error 且当前轨道有效的点补帧（并发受控于 extractor） */
+  /** 为所有 stale/idle/error 且仍被覆盖的点补帧（并发受控于 extractor） */
   refreshStaleFrames() {
     const need = this.timeline
       .confirmedSnapshot()
-      .filter((p) => p.frameStatus !== "ok" && p.frameStatus !== "loading");
+      .filter(
+        (p) =>
+          p.sourceTime != null &&
+          p.frameStatus !== "ok" &&
+          p.frameStatus !== "loading",
+      );
     return Promise.all(need.map((p) => this.ensurePointFrame(p)));
   }
 
@@ -260,6 +287,7 @@ export class App {
   locatePlayback(point) {
     const snap = this.timeline.confirmedSnapshot();
     const p = snap.find((x) => x.id === point.id) ?? point;
+    if (p.sourceTime == null) return null; // 当前不在任何覆盖区间内
     const entry = this.files.get(p.trackId);
     if (!entry) return null;
     this.playFile = { trackId: p.trackId, url: entry.url };

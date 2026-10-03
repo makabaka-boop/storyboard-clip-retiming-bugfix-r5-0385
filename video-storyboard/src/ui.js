@@ -1,6 +1,7 @@
 // 页面渲染层：只处理 DOM/事件；所有规则在 src/ 模块中。
 import { App } from "./app.js";
 import { MAX_POINTS, frameKeyFor } from "./timeline.js";
+import { coverage } from "./clipEdit.js";
 import { FrameExtractor } from "./extractor.js";
 import { formatTime } from "./exports.js";
 import { makeHarness, FakeCanvas } from "../test/fakes.js";
@@ -58,7 +59,7 @@ function renderTracks() {
     card.className = "track-card";
     card.innerHTML = `
       <div class="name">#${i + 1} ${escapeHtml(t.name)}</div>
-      <div class="meta">${formatTime(t.duration)} · ${t.width || "?"}×${t.height || "?"}</div>
+      <div class="meta">素材 ${formatTime(t.duration)} · 覆盖 ${formatTime(coverage(t))}${t.edit?.reverse ? " · 反向" : ""} · ${t.width || "?"}×${t.height || "?"}</div>
       <div class="digest" title="${t.digest?.algo}:${t.digest?.hex}">${t.digest?.algo}:${(t.digest?.hex ?? "").slice(0, 24)}…</div>
       <div class="row" style="margin-top:8px">
         <span>项目偏移(s)</span>
@@ -94,6 +95,7 @@ function renderTracks() {
         });
       } catch (error) {
         toast(error.message, true);
+        render(); // 非法输入未生效：表单回显当前实际剪辑参数
       }
     });
   });
@@ -153,14 +155,19 @@ function renderPoints() {
       const ov = document.createElement("div");
       ov.className =
         "status-overlay" + (p.frameStatus === "error" ? " err" : "");
-      ov.textContent =
-        p.frameStatus === "loading"
-          ? "取帧中…（旧帧已作废）"
-          : p.frameStatus === "error"
-            ? "取帧失败（点击重试）"
-            : "缺帧（点击重试）";
+      if (p.sourceTime == null) {
+        // 失去覆盖的点：不展示旧图，也不提供“重试”（没有可取的源时间）
+        ov.textContent = "不在覆盖区间（调整剪辑/偏移后自动恢复）";
+      } else {
+        ov.textContent =
+          p.frameStatus === "loading"
+            ? "取帧中…（旧帧已作废）"
+            : p.frameStatus === "error"
+              ? "取帧失败（点击重试）"
+              : "缺帧（点击重试）";
+        thumb.addEventListener("click", () => app.ensurePointFrame(p));
+      }
       thumb.appendChild(ov);
-      thumb.addEventListener("click", () => app.ensurePointFrame(p));
     }
     thumb.insertAdjacentHTML(
       "beforeend",
@@ -200,7 +207,7 @@ function renderPoints() {
 function playAt(point, card) {
   const loc = app.locatePlayback(point);
   if (!loc) {
-    toast("该分镜点对应的轨道已不存在", true);
+    toast("该分镜点当前不可定位（不在覆盖区间或轨道已删除）", true);
     return;
   }
   if (player.dataset.url !== loc.url) {
@@ -263,7 +270,8 @@ function renderRuler() {
   tracks.forEach((t, i) => {
     const y = top0 + i * (laneH + laneGap);
     const x = xOf(t.offset);
-    const w = Math.max(2, xOf(t.offset + t.duration) - x);
+    // 车道长度 = 剪辑后的项目覆盖长度（入出点/倍速感知），不是整段素材
+    const w = Math.max(2, xOf(t.offset + coverage(t)) - x);
     ctx.fillStyle = TRACK_COLORS[i % TRACK_COLORS.length] + "55";
     ctx.fillRect(x, y, w, laneH);
     ctx.strokeStyle = TRACK_COLORS[i % TRACK_COLORS.length];

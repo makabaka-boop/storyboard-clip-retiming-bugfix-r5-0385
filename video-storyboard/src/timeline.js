@@ -78,6 +78,16 @@ export class Timeline {
       width: patch.width ?? track.width,
       height: patch.height ?? track.height,
     });
+    // 换成更短素材可能使既有剪辑失效（如出点超出新时长）：
+    // 重新整体校验，通不过就重置为未剪辑——绝不让 out>duration
+    // 之类的状态部分生效后继续参与解析。
+    if (track.edit) {
+      try {
+        track.edit = validateEdit(track, track.edit);
+      } catch {
+        track.edit = null;
+      }
+    }
     // 替换文件后，即使源时间恰好相同，该轨所有已取帧也必须作废重取
     //（旧文件的内容不得占据新分镜）。
     for (const p of this.points) {
@@ -92,11 +102,18 @@ export class Timeline {
     return track;
   }
 
+  /**
+   * 应用剪辑（入点/出点/倍速/反向）。validateEdit 先整体校验，
+   * 非法即抛错且 track.edit 保持原值——不会部分生效。
+   * edit 为 null 表示清除剪辑。
+   */
   setClipEdit(id, edit) {
     const track = this.getTrack(id);
     if (!track) throw new TimelineError("NO_TRACK", "轨道不存在");
-    track.edit = validateEdit(track, edit);
+    const normalized = validateEdit(track, edit); // 非法 -> 抛错，下方不执行
+    track.edit = normalized;
     this._recomputePoints();
+    return track;
   }
 
   setOffset(id, offset) {
@@ -133,19 +150,28 @@ export class Timeline {
 
   /**
    * 项目时间 -> {track, sourceTime}；落在空隙返回 null。
-   * 多轨重叠时取插入顺序最早的轨道（确定且可解释）。
+   * 覆盖区间按半开 [offset, offset+coverage) 判定：
+   *  - 多轨重叠时取插入顺序最早的轨道（确定且可解释）；
+   *  - 相邻剪辑的切点（前一段的末端）归后续覆盖片段；
+   *  - 仅当 t 落在某轨覆盖末端的 EPS 邻域内且没有任何轨道覆盖它时
+   *    （项目范围末端），才归该轨并把源时间钳到覆盖末端。
    */
   resolve(projectTime) {
     for (const track of this.tracks) {
+      const cov = coverage(track);
       const s = projectTime - track.offset;
-      if (s >= -EPS && s <= coverage(track) + EPS) {
+      if (s >= -EPS && s < cov - EPS) {
         return {
           track,
-          sourceTime: sourceAt(
-            track,
-            Math.min(Math.max(s, 0), coverage(track)),
-          ),
+          sourceTime: sourceAt(track, Math.min(Math.max(s, 0), cov)),
         };
+      }
+    }
+    for (const track of this.tracks) {
+      const cov = coverage(track);
+      const s = projectTime - track.offset;
+      if (s >= cov - EPS && s <= cov + EPS) {
+        return { track, sourceTime: sourceAt(track, cov) };
       }
     }
     return null;
@@ -185,6 +211,7 @@ export class Timeline {
       if (snapped === null) return { ok: false, error: "尚未导入任何视频" };
       projectTime = snapped;
       r = this.resolve(projectTime);
+      if (!r) return { ok: false, error: "该时刻不在任何轨道覆盖内" };
     }
     const ms = Math.round(projectTime * 1000);
     if (
@@ -244,14 +271,19 @@ export class Timeline {
   }
 
   /**
-   * 轨道偏移/替换/删除后重新解析每个点。
+   * 轨道偏移/剪辑/替换/删除后重新解析每个点。
    * 解析结果变化（换轨或源时间变化）的点立即丢弃旧帧并标记 stale：
    * 旧内容不允许继续占据新分镜，等待上层重新取帧。
+   * 失去覆盖的点：丢弃旧帧，并清空 sourceTime/frameKey（不变量：
+   * sourceTime === null 当且仅当该点当前不在任何轨道覆盖内），
+   * 上层据此跳过取帧，旧图不会以“重取”的方式回流。
    */
   _recomputePoints() {
     for (const p of this.points) {
       const r = this.resolve(p.projectTime);
       if (!r) {
+        p.sourceTime = null;
+        p.frameKey = null;
         this._invalidate(p, null);
         continue;
       }

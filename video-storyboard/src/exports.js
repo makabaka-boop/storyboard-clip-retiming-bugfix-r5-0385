@@ -2,6 +2,8 @@
 // 两者只能接收 Timeline.confirmedSnapshot() 的同一返回值，
 // 调用方在生成期间不得再修改分镜（见 app 中的 freezeSnapshot 用法）。
 
+import { coverage } from "./clipEdit.js";
+
 export function formatTime(sec) {
   if (!Number.isFinite(sec)) return "--:--.--";
   const neg = sec < 0;
@@ -153,7 +155,7 @@ export function buildManifest(snapshot, tracks, sheetMeta = null) {
     version: 1,
     generatedAt: new Date().toISOString(),
     projectDuration: trackList.reduce(
-      (m, t) => Math.max(m, t.offset + t.duration),
+      (m, t) => Math.max(m, t.offset + coverage(t)),
       0,
     ),
     tracks: trackList.map((t) => ({
@@ -163,6 +165,7 @@ export function buildManifest(snapshot, tracks, sheetMeta = null) {
       digest: t.digest?.hex ?? null,
       duration: round3(t.duration),
       edit: t.edit ? { ...t.edit } : null,
+      coverage: round3(coverage(t)),
       width: t.width ?? null,
       height: t.height ?? null,
       offset: round3(t.offset),
@@ -184,7 +187,9 @@ export function buildManifest(snapshot, tracks, sheetMeta = null) {
         projectTime: round3(p.projectTime),
         trackId: p.trackId,
         trackName: track?.name ?? null,
-        sourceTime: round3(p.sourceTime),
+        // 失去覆盖的点没有有效源时间：导出 null 而不是过期映射
+        sourceTime: p.sourceTime == null ? null : round3(p.sourceTime),
+        covered: p.sourceTime != null,
         frameKey: p.frameKey ?? null,
         frameReady: !!p.frame,
         frameFromCache: !!p.frameFromCache,

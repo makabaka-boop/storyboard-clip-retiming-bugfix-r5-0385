@@ -9,6 +9,8 @@
 //  F. 缓存：取帧 -> 重载页面 -> 重新选中“内容相同”的文件 -> 命中缓存
 //     (frameFromCache=true)；不选文件则无从命中；
 //  G. 强制缓存写失败不影响清单生成。
+//  H. 剪辑：入出点/倍速/倒放驱动覆盖长度与源时间映射；失去覆盖的点清帧
+//     且不重取；非法剪辑整体拒绝；恢复覆盖后按当前剪辑重取。
 
 import { chromium } from "playwright";
 import { createServer } from "node:http";
@@ -76,6 +78,22 @@ async function waitFrames(page, n, timeoutMs = 30000) {
       );
     },
     n,
+    { timeout: timeoutMs },
+  );
+}
+
+/** 剪辑场景：被覆盖的点全部取帧结束，失去覆盖的点保持无帧 idle */
+async function waitSettled(page, timeoutMs = 40000) {
+  return page.waitForFunction(
+    () => {
+      const pts = globalThis.__app.timeline.confirmedSnapshot();
+      return pts.every((p) =>
+        p.sourceTime == null
+          ? p.frameStatus === "idle" && !p.frame
+          : p.frameStatus === "ok" || p.frameStatus === "error",
+      );
+    },
+    null,
     { timeout: timeoutMs },
   );
 }
@@ -464,6 +482,273 @@ async function main() {
       return m.format === "video-storyboard-manifest" && m.points.length === 8;
     });
     check("缓存持续失败时取帧与 JSON 清单仍然正常", manifestOk);
+
+    // ---------------- H. 剪辑：入出点/倍速/倒放 ----------------
+    console.log("H. 剪辑（入出点/倍速/倒放）与点位归属");
+    // 当前状态：clip-a [0,d1)，clip-b 偏移 2，8 个均匀点全部就绪。
+    // 样本真实时长并非整数秒，期望值一律从页面实际状态推导。
+    const editRes = await page.evaluate(async () => {
+      const app = globalThis.__app;
+      const [t1, t2] = app.tracks();
+      // clip-a: 入 1s 出 3s，2 倍速 -> 项目覆盖 [0,1)
+      await app.commitClipEdit(t1.id, { in: 1, out: 3, rate: 2 });
+      return {
+        duration: app.timeline.projectDuration(),
+        d2: t2.duration,
+        end2: t2.offset + t2.duration,
+      };
+    });
+    check(
+      "剪辑后项目总时长仍由最远覆盖端决定（轨道2 末端）",
+      Math.abs(editRes.duration - editRes.end2) < 0.05,
+      `got ${editRes.duration}, want ${editRes.end2}`,
+    );
+    await waitSettled(page);
+    const afterEdit = await page.evaluate(() => {
+      const app = globalThis.__app;
+      const pts = app.timeline.confirmedSnapshot();
+      const covered = pts.filter((p) => p.sourceTime != null);
+      const uncovered = pts.filter((p) => p.sourceTime == null);
+      const t1 = app.tracks()[0];
+      // 轨道1 覆盖 [0,1)：其上的点源时间 = 1 + 项目经过×2
+      const onT1 = covered.filter((p) => p.trackId === t1.id);
+      return {
+        mapOk: onT1.every(
+          (p) => Math.abs(p.sourceTime - (1 + 2 * p.projectTime)) < 1e-6,
+        ),
+        // 项目时间落在 [1,2) 的点必须失去覆盖：无帧、无源时间、idle
+        uncoveredOk: uncovered.every(
+          (p) =>
+            p.projectTime >= 1 - 1e-6 &&
+            p.projectTime < 2 &&
+            !p.frame &&
+            !p.frameURL &&
+            p.frameStatus === "idle",
+        ),
+        hasUncovered: uncovered.length > 0,
+        // 与 resolve 完全一致（点位归属遵守当前剪辑）
+        consistent: covered.every((p) => {
+          const r = app.timeline.resolve(p.projectTime);
+          return (
+            r &&
+            r.track.id === p.trackId &&
+            Math.abs(r.sourceTime - p.sourceTime) < 1e-6
+          );
+        }),
+        probeId: onT1[1]?.id ?? onT1[0]?.id,
+        probeSrc: (onT1[1] ?? onT1[0])?.sourceTime,
+      };
+    });
+    check(
+      "点位源时间按剪辑映射（源=入点+项目经过×倍速）且与 resolve 一致",
+      afterEdit.mapOk && afterEdit.consistent,
+    );
+    check(
+      "失去覆盖的点清空帧与源时间、保持 idle 不重取",
+      afterEdit.hasUncovered && afterEdit.uncoveredOk,
+    );
+    if (afterEdit.probeId && afterEdit.probeSrc > 2.1)
+      check(
+        "倍速剪辑后帧内容属于新源时间（源 2.x s → hue≈80）",
+        hueNear(await frameHue(page, afterEdit.probeId), 80),
+        `hue=${await frameHue(page, afterEdit.probeId)} src=${afterEdit.probeSrc}`,
+      );
+
+    // 倒放 clip-b：项目时间正向，源时间从出点走向入点
+    const reverseInfo = await page.evaluate(async () => {
+      const app = globalThis.__app;
+      const t2 = app.tracks()[1];
+      await app.commitClipEdit(t2.id, {
+        in: 0,
+        out: t2.duration,
+        rate: 1,
+        reverse: true,
+      });
+      // 出点经校验归一化到毫秒，期望值以生效的剪辑为准
+      return { out: t2.edit.out, off2: t2.offset };
+    });
+    await waitSettled(page);
+    const afterReverse = await page.evaluate((info) => {
+      const app = globalThis.__app;
+      const t2 = app.tracks()[1];
+      const pts = app.timeline
+        .confirmedSnapshot()
+        .filter((p) => p.trackId === t2.id && p.sourceTime != null);
+      const mapOk = pts.every(
+        (p) =>
+          Math.abs(
+            p.sourceTime - (info.out - (p.projectTime - info.off2)),
+          ) < 1e-6,
+      );
+      const last = pts[pts.length - 1];
+      return { mapOk, lastId: last?.id, lastSrc: last?.sourceTime };
+    }, reverseInfo);
+    check(
+      "倒放点位源时间反向映射（源=出点-项目经过×倍速）",
+      afterReverse.mapOk,
+    );
+    if (afterReverse.lastId && afterReverse.lastSrc < 0.9)
+      check(
+        "倒放帧内容正确（clip-b 源 <1s → hue≈160）",
+        hueNear(await frameHue(page, afterReverse.lastId), 160),
+        `hue=${await frameHue(page, afterReverse.lastId)} src=${afterReverse.lastSrc}`,
+      );
+
+    // 非法剪辑：整体拒绝，不产生部分生效状态
+    const invalid = await page.evaluate(async () => {
+      const app = globalThis.__app;
+      const t1 = app.tracks()[0];
+      const before = JSON.stringify(t1.edit);
+      const srcBefore = JSON.stringify(
+        app.timeline.confirmedSnapshot().map((p) => p.sourceTime),
+      );
+      const r1 = await app
+        .commitClipEdit(t1.id, { in: 2, out: 1, rate: 1 })
+        .then(() => ({ ok: true }), (e) => ({ ok: false, code: e.code }));
+      const r2 = await app
+        .commitClipEdit(t1.id, { in: 0, out: 3, rate: 0 })
+        .then(() => ({ ok: true }), (e) => ({ ok: false, code: e.code }));
+      const r3 = await app
+        .commitClipEdit(t1.id, { in: 0, out: 999, rate: 1 })
+        .then(() => ({ ok: true }), (e) => ({ ok: false, code: e.code }));
+      return {
+        codes: [r1.code, r2.code, r3.code],
+        unchanged: JSON.stringify(t1.edit) === before,
+        srcSame:
+          JSON.stringify(
+            app.timeline.confirmedSnapshot().map((p) => p.sourceTime),
+          ) === srcBefore,
+      };
+    });
+    check(
+      "非法入出点/零倍速/出点超时长整体拒绝（BAD_EDIT）",
+      invalid.codes.every((c) => c === "BAD_EDIT"),
+      JSON.stringify(invalid.codes),
+    );
+    check(
+      "非法剪辑后轨道状态与全部点位源时间原样保留",
+      invalid.unchanged && invalid.srcSame,
+    );
+
+    // 进一步剪短 clip-a 到 [1,1.5)：更多点失去覆盖
+    const shrink = await page.evaluate(async () => {
+      const app = globalThis.__app;
+      await app.commitClipEdit(app.tracks()[0].id, { in: 1, out: 1.5, rate: 1 });
+      return null;
+    });
+    void shrink;
+    await waitSettled(page);
+    const moreUncovered = await page.evaluate(() => {
+      const app = globalThis.__app;
+      const pts = app.timeline.confirmedSnapshot();
+      const t1 = app.tracks()[0];
+      // 轨道1 现在只覆盖 [0,0.5)：其上不应再有 projectTime>=0.5 的覆盖点
+      const uncovered = pts.filter((p) => p.sourceTime == null);
+      return {
+        noStaleFrames: pts.every(
+          (p) => p.sourceTime != null || (!p.frame && !p.frameURL),
+        ),
+        t1CoveredInRange: pts
+          .filter((p) => p.trackId === t1.id && p.sourceTime != null)
+          .every((p) => p.projectTime < 0.5 + 1e-6),
+        hasUncovered: uncovered.length > 0,
+      };
+    });
+    check(
+      "剪短轨道后新失去覆盖的点同样不保留旧图",
+      moreUncovered.noStaleFrames &&
+        moreUncovered.t1CoveredInRange &&
+        moreUncovered.hasUncovered,
+      JSON.stringify(moreUncovered),
+    );
+
+    // 清除两轨剪辑：恢复整段，失去覆盖的点按当前剪辑重新解析并重取
+    await page.evaluate(async () => {
+      const app = globalThis.__app;
+      await app.commitClipEdit(app.tracks()[0].id, null);
+      await app.commitClipEdit(app.tracks()[1].id, null);
+    });
+    await waitSettled(page);
+    const restored = await page.evaluate(() => {
+      const app = globalThis.__app;
+      const pts = app.timeline.confirmedSnapshot();
+      const consistent = pts.every((p) => {
+        const r = app.timeline.resolve(p.projectTime);
+        return (
+          r &&
+          r.track.id === p.trackId &&
+          Math.abs(r.sourceTime - p.sourceTime) < 1e-6
+        );
+      });
+      // 找一个恢复覆盖的轨道1 中源时间在 1~2s 的点做帧内容抽查
+      const t1 = app.tracks()[0];
+      const probe = pts.find(
+        (p) =>
+          p.trackId === t1.id && p.sourceTime > 1.1 && p.sourceTime < 1.9,
+      );
+      return {
+        allOk: pts.every((p) => p.frameStatus === "ok"),
+        consistent,
+        probeId: probe?.id,
+      };
+    });
+    check(
+      "恢复覆盖后全部点按当前剪辑重取就绪且与 resolve 一致",
+      restored.allOk && restored.consistent,
+    );
+    if (restored.probeId)
+      check(
+        "恢复覆盖的点帧内容正确（clip-a 源 1.x s → hue≈40）",
+        hueNear(await frameHue(page, restored.probeId), 40),
+        `hue=${await frameHue(page, restored.probeId)}`,
+      );
+
+    // 清单遵守剪辑参数
+    const manifestClip = await page.evaluate(async () => {
+      const app = globalThis.__app;
+      const t1 = app.tracks()[0];
+      await app.commitClipEdit(t1.id, {
+        in: 1,
+        out: 3,
+        rate: 2,
+        reverse: false,
+      });
+      const m = app.buildManifestNow();
+      const pts = app.timeline.confirmedSnapshot();
+      return {
+        projectDuration: m.projectDuration,
+        cov: m.tracks.map((t) => t.coverage),
+        edit: m.tracks[0].edit,
+        // 清单逐点源时间/覆盖标记与时间轴当前解析一致
+        manifestConsistent: m.points.every((mp, i) => {
+          const live = pts[i];
+          if (mp.id !== live.id) return false;
+          if (mp.sourceTime === null)
+            return live.sourceTime === null && mp.covered === false;
+          return (
+            Math.abs(mp.sourceTime - live.sourceTime) < 1e-6 &&
+            mp.covered === true
+          );
+        }),
+      };
+    });
+    check(
+      "清单项目总时长与轨道覆盖长度遵守剪辑参数",
+      Math.abs(manifestClip.cov[0] - 1) < 1e-6 &&
+        manifestClip.edit?.in === 1 &&
+        manifestClip.edit?.rate === 2,
+      JSON.stringify(manifestClip.cov),
+    );
+    check(
+      "清单逐点源时间与覆盖标记遵守当前剪辑（失去覆盖导出 null）",
+      manifestClip.manifestConsistent,
+    );
+    // 还原：清除剪辑并补帧，避免影响后续检查
+    await page.evaluate(async () => {
+      const app = globalThis.__app;
+      await app.commitClipEdit(app.tracks()[0].id, null);
+    });
+    await waitSettled(page);
 
     // ---------------- 页面无错误日志 ----------------
     const realErrors = pageErrors.filter(
