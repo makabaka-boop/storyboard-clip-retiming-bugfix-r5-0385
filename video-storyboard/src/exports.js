@@ -1,6 +1,10 @@
 // 导出物：PNG 接触表 与 JSON 清单。
 // 两者只能接收 Timeline.confirmedSnapshot() 的同一返回值，
 // 调用方在生成期间不得再修改分镜（见 app 中的 freezeSnapshot 用法）。
+// 清单中的项目时长/轨道覆盖/源时间一律按当前剪辑参数
+// （入点/出点/倍速/反向）计算，与画面内容同源。
+
+import { coverage } from "./clipEdit.js";
 
 export function formatTime(sec) {
   if (!Number.isFinite(sec)) return "--:--.--";
@@ -152,9 +156,8 @@ export function buildManifest(snapshot, tracks, sheetMeta = null) {
     format: "video-storyboard-manifest",
     version: 1,
     generatedAt: new Date().toISOString(),
-    projectDuration: trackList.reduce(
-      (m, t) => Math.max(m, t.offset + t.duration),
-      0,
+    projectDuration: round3(
+      trackList.reduce((m, t) => Math.max(m, t.offset + coverage(t)), 0),
     ),
     tracks: trackList.map((t) => ({
       id: t.id,
@@ -163,6 +166,7 @@ export function buildManifest(snapshot, tracks, sheetMeta = null) {
       digest: t.digest?.hex ?? null,
       duration: round3(t.duration),
       edit: t.edit ? { ...t.edit } : null,
+      coverage: round3(coverage(t)),
       width: t.width ?? null,
       height: t.height ?? null,
       offset: round3(t.offset),

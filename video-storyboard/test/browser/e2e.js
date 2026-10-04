@@ -9,6 +9,8 @@
 //  F. 缓存：取帧 -> 重载页面 -> 重新选中“内容相同”的文件 -> 命中缓存
 //     (frameFromCache=true)；不选文件则无从命中；
 //  G. 强制缓存写失败不影响清单生成。
+//  H. 剪辑参数（入点/出点/倍速/反向）：覆盖时长、点位源时间、帧内容、
+//     非法编辑拒绝、剪短后失去覆盖的点、替换更短素材——全部按当前剪辑生效。
 
 import { chromium } from "playwright";
 import { createServer } from "node:http";
@@ -464,6 +466,207 @@ async function main() {
       return m.format === "video-storyboard-manifest" && m.points.length === 8;
     });
     check("缓存持续失败时取帧与 JSON 清单仍然正常", manifestOk);
+
+    // ---------------- H. 剪辑参数：入点/出点/倍速/反向 ----------------
+    console.log("H. 剪辑参数（入点/出点/倍速/反向）端到端");
+    await page.evaluate(() => {
+      const app = globalThis.__app;
+      app.clearPoints();
+      const [, b] = app.tracks();
+      app.commitOffset(b.id, 0); // B 归零偏移，便于推算
+    });
+    // A: 入点 1 / 出点 3 / 2 倍速 -> 覆盖 1s；项目总时长 = max(1, 3) = 3s
+    await page.evaluate(() => {
+      const app = globalThis.__app;
+      return app.commitClipEdit(app.tracks()[0].id, {
+        in: 1,
+        out: 3,
+        rate: 2,
+        reverse: false,
+      });
+    });
+    const clipDur = await page.evaluate(() =>
+      globalThis.__app.timeline.projectDuration(),
+    );
+    check(
+      "剪辑后项目总时长按覆盖计算（A 1s / B 3s -> 3s）",
+      Math.abs(clipDur - 3) < 0.05,
+      `got ${clipDur}`,
+    );
+
+    await page.evaluate(() => globalThis.__app.addUniform(6));
+    await waitFrames(page, 6);
+    const clipPoints = await page.evaluate(() => {
+      const app = globalThis.__app;
+      const aId = app.tracks()[0].id;
+      return app.timeline.confirmedSnapshot().map((p) => ({
+        id: p.id,
+        t: p.projectTime,
+        src: p.sourceTime,
+        onA: p.trackId === aId,
+        ok: p.frameStatus === "ok",
+      }));
+    });
+    check("剪辑后 6 个分镜点全部就绪", clipPoints.every((p) => p.ok));
+    const onA = clipPoints.filter((p) => p.onA);
+    check(
+      "A 轨点位源时间 = 入点1 + 2×项目时间",
+      onA.length === 2 &&
+        onA.every((p) => Math.abs(p.src - (1 + 2 * p.t)) < 0.02),
+      JSON.stringify(onA),
+    );
+    // 帧内容：A 源时间落在 [2,3) 的点，背景色相应为 hue=80
+    const aFwd = onA.find((p) => p.src >= 2 && p.src < 3);
+    if (aFwd)
+      check(
+        "正放倍速帧内容正确（clip-a 源 2.x -> hue≈80）",
+        hueNear(await frameHue(page, aFwd.id), 80),
+        `hue=${await frameHue(page, aFwd.id)}`,
+      );
+
+    // 开启倒放：同一项目时间映射到出点侧（源 3 - 2×项目时间）
+    await page.evaluate(() => {
+      const app = globalThis.__app;
+      return app.commitClipEdit(app.tracks()[0].id, {
+        in: 1,
+        out: 3,
+        rate: 2,
+        reverse: true,
+      });
+    });
+    await waitFrames(page, 6);
+    const revPoints = await page.evaluate(() => {
+      const app = globalThis.__app;
+      const aId = app.tracks()[0].id;
+      return app.timeline
+        .confirmedSnapshot()
+        .filter((p) => p.trackId === aId)
+        .map((p) => ({ id: p.id, t: p.projectTime, src: p.sourceTime }));
+    });
+    check(
+      "倒放点位源时间 = 出点3 - 2×项目时间（项目时间仍正向）",
+      revPoints.length === 2 &&
+        revPoints.every((p) => Math.abs(p.src - (3 - 2 * p.t)) < 0.02),
+      JSON.stringify(revPoints),
+    );
+    const aRev = revPoints.find((p) => p.src >= 1 && p.src < 2);
+    if (aRev)
+      check(
+        "倒放帧内容正确（clip-a 源 1.x -> hue≈40）",
+        hueNear(await frameHue(page, aRev.id), 40),
+        `hue=${await frameHue(page, aRev.id)}`,
+      );
+
+    // 非法编辑：整体拒绝，轨道状态不变（无部分生效）
+    const invalid = await page.evaluate(() => {
+      const app = globalThis.__app;
+      const a = app.tracks()[0];
+      const before = JSON.stringify({
+        edit: a.edit,
+        D: app.timeline.projectDuration(),
+        pts: app.timeline.confirmedSnapshot().map((p) => [p.trackId, p.sourceTime]),
+      });
+      const results = [
+        { in: -1, out: 3, rate: 1 },
+        { in: 1, out: 99, rate: 1 },
+        { in: 2, out: 2, rate: 1 },
+        { in: 1, out: 3, rate: 0 },
+        { in: 1, out: 3, rate: Number.NaN },
+      ].map((edit) => {
+        try {
+          app.timeline.setClipEdit(a.id, edit);
+          return false;
+        } catch {
+          return true;
+        }
+      });
+      const after = JSON.stringify({
+        edit: a.edit,
+        D: app.timeline.projectDuration(),
+        pts: app.timeline.confirmedSnapshot().map((p) => [p.trackId, p.sourceTime]),
+      });
+      return { allThrew: results.every(Boolean), unchanged: before === after };
+    });
+    check(
+      "无效速度/入出点全部拒绝且轨道状态不变",
+      invalid.allThrew && invalid.unchanged,
+      JSON.stringify(invalid),
+    );
+
+    // 剪短 B 到 [0,1)：项目时间 ≥1 的点失去覆盖
+    await page.evaluate(() => {
+      const app = globalThis.__app;
+      return app.commitClipEdit(app.tracks()[1].id, {
+        in: 0,
+        out: 1,
+        rate: 1,
+        reverse: false,
+      });
+    });
+    const trimmed = await page.evaluate(() => {
+      const app = globalThis.__app;
+      return {
+        snapN: app.timeline.confirmedSnapshot().length,
+        orphans: app.timeline.points.filter((p) => !p.trackId).length,
+        orphanFrames: app.timeline.points.filter((p) => !p.trackId && p.frame)
+          .length,
+        D: app.timeline.projectDuration(),
+      };
+    });
+    check(
+      "剪短轨道后失去覆盖的分镜脱离快照且不留旧图",
+      trimmed.snapN === 2 && trimmed.orphans === 4 && trimmed.orphanFrames === 0,
+      JSON.stringify(trimmed),
+    );
+    check("剪短后项目总时长 = 1s", Math.abs(trimmed.D - 1) < 0.05);
+
+    // 替换为更短素材：A(4s, 剪辑 1~3) 换成 clip-b(3s)，出点仍可容纳；
+    // 帧全部重取且内容来自新文件（clip-b 源 2.x -> hue≈240）
+    await page.evaluate(async () => {
+      const app = globalThis.__app;
+      const resp = await fetch("/samples/clip-b.webm");
+      const blob = await resp.blob();
+      const file = new File([blob], "clip-b.webm", { type: "video/webm" });
+      await app.replaceFile(app.tracks()[0].id, file);
+    });
+    await waitFrames(page, 2);
+    const replaced = await page.evaluate(() => {
+      const app = globalThis.__app;
+      const a = app.tracks()[0];
+      return {
+        duration: a.duration,
+        edit: a.edit,
+        pts: app.timeline.confirmedSnapshot().map((p) => ({
+          id: p.id,
+          src: p.sourceTime,
+          ok: p.frameStatus === "ok",
+        })),
+      };
+    });
+    check(
+      "替换更短素材：时长/剪辑收缩一致，帧全部重取",
+      Math.abs(replaced.duration - 3) < 0.1 &&
+        replaced.edit.out <= 3 &&
+        replaced.pts.every((p) => p.ok),
+      JSON.stringify(replaced),
+    );
+    const repProbe = replaced.pts.find((p) => p.src >= 2 && p.src < 3);
+    if (repProbe)
+      check(
+        "替换后帧来自新文件（clip-b 源 2.x -> hue≈240）",
+        hueNear(await frameHue(page, repProbe.id), 240),
+        `hue=${await frameHue(page, repProbe.id)}`,
+      );
+
+    // 清单与画面同遵剪辑参数
+    const mani = await page.evaluate(() => globalThis.__app.buildManifestNow());
+    check(
+      "清单项目时长/轨道覆盖/点位源时间遵守当前剪辑",
+      Math.abs(mani.projectDuration - 1) < 0.05 &&
+        mani.tracks.every((t) => typeof t.coverage === "number") &&
+        mani.points.length === 2,
+      JSON.stringify({ D: mani.projectDuration, n: mani.points.length }),
+    );
 
     // ---------------- 页面无错误日志 ----------------
     const realErrors = pageErrors.filter(

@@ -1,10 +1,11 @@
-// 应用主控：导入/偏移/取帧调度/播放/导出。
+// 应用主控：导入/偏移/剪辑/取帧调度/播放/导出。
 // 不变量：
 //  1) 点击播放、PNG 接触表、JSON 清单三者只能消费同一次
 //     confirmedSnapshot() 的返回值（freezeSnapshot）；
-//  2) 取帧的竞争安全全部由 FrameExtractor 保证（令牌+换代）；
+//  2) 取帧的竞争安全由 FrameExtractor（令牌+换代）与分镜点 frameGen
+//     双重保证：编辑/替换/取消后，在途帧与旧缓存回读都不得提交；
 //  3) 缓存失败只影响“帧”，Timeline 与分镜清单永远可用；
-//  4) objectURL 失效时统一经 releasePointFrame 回收。
+//  4) objectURL 在帧被作废/替换/移除时统一回收（onPointInvalidate 钩子）。
 
 import { Timeline, frameKeyFor } from "./timeline.js";
 import { FrameExtractor } from "./extractor.js";
@@ -17,7 +18,12 @@ const OFFSET_DEBOUNCE_MS = 150;
 
 export class App {
   constructor({ extractor, cache } = {}) {
-    this.timeline = new Timeline();
+    // 分镜点帧被时间轴作废（剪辑/偏移/替换/失去覆盖）时回收其 objectURL
+    this.timeline = new Timeline({
+      onPointInvalidate: (p) => {
+        if (p.frameURL) URL.revokeObjectURL(p.frameURL);
+      },
+    });
     this.extractor =
       extractor ??
       new FrameExtractor({
@@ -81,16 +87,13 @@ export class App {
     return track;
   }
 
-  /** 替换某轨的源文件：在途帧立即换代失效，旧 URL 回收 */
+  /** 替换某轨的源文件：先校验并落数据，再换代在途帧、换 URL——失败则整体不变 */
   async replaceFile(trackId, file) {
     const entry = this.files.get(trackId);
     const { algo, hex, bytes } = await digestFile(file);
     const meta = await probeVideo(file);
-    // 先换代：任何属于旧文件的在途取帧都不允许提交
-    this.extractor.bumpTrack(trackId);
-    if (entry) URL.revokeObjectURL(entry.url);
-    const url = URL.createObjectURL(file);
-    this.files.set(trackId, { url, file, bytes, digest: { algo, hex } });
+    // 先改时间轴：时长非法或已有剪辑区间放不进新素材时在这里整体抛错，
+    // 此刻文件映射、objectURL、在途任务都还没动，绝不留下部分生效状态。
     this.timeline.replaceTrack(trackId, {
       file,
       name: file.name,
@@ -99,6 +102,11 @@ export class App {
       width: meta.width,
       height: meta.height,
     });
+    // 数据已生效：任何属于旧文件的在途取帧都不允许提交，旧 URL 回收
+    this.extractor.bumpTrack(trackId);
+    if (entry) URL.revokeObjectURL(entry.url);
+    const url = URL.createObjectURL(file);
+    this.files.set(trackId, { url, file, bytes, digest: { algo, hex } });
     if (this.playFile?.trackId === trackId) this.playFile = { trackId, url };
     this.emit();
     await this.refreshStaleFrames();
@@ -115,30 +123,42 @@ export class App {
     if (this.playFile?.trackId === trackId) this.playFile = null;
     this.timeline.removeTrack(trackId);
     this.emit();
+    // 重新解析后落到其他轨道的点已被标记 stale，立即补帧
+    this.refreshStaleFrames();
   }
 
   // ---------- 偏移 ----------
 
   /** 拖动/输入时实时更新（内部做防抖合并重取帧） */
   requestOffsetChange(trackId, offset) {
-    const t = this._offsetTimers.get(trackId);
-    if (t) clearTimeout(t);
+    const rec = this._offsetTimers.get(trackId) ?? { timer: null, dirty: false };
+    if (rec.timer) clearTimeout(rec.timer);
     try {
-      this.timeline.setOffset(trackId, Number(offset) || 0);
+      if (this.timeline.setOffset(trackId, Number(offset) || 0)) {
+        rec.dirty = true;
+      }
       this.emit();
     } catch {
       /* 中间态非法值忽略 */
     }
-    this._offsetTimers.set(
-      trackId,
-      setTimeout(() => {
-        this._offsetTimers.delete(trackId);
+    rec.timer = setTimeout(() => {
+      this._offsetTimers.delete(trackId);
+      // 只有偏移真的变化过才换代在途取帧：无变化的换代会误杀
+      // 仍在有效源时间上的取帧任务，使分镜点卡在“取帧中”
+      if (rec.dirty) {
         this.extractor.bumpTrack(trackId);
         this.refreshStaleFrames();
-      }, OFFSET_DEBOUNCE_MS),
-    );
+      }
+    }, OFFSET_DEBOUNCE_MS);
+    this._offsetTimers.set(trackId, rec);
   }
 
+  /**
+   * 应用剪辑参数。非法编辑在 timeline 层整体抛错（轨道状态不变）；
+   * 合法编辑只使“解析结果变化”的点作废（frameGen 推进），
+   * 解析未变化的点其“在途取帧”仍然有效——因此这里刻意不做
+   * extractor.bumpTrack，避免误杀有效任务造成半吊子状态。
+   */
   async commitClipEdit(trackId, edit) {
     this.timeline.setClipEdit(trackId, edit);
     this.emit();
@@ -146,13 +166,14 @@ export class App {
   }
 
   commitOffset(trackId, offset) {
-    const t = this._offsetTimers.get(trackId);
-    if (t) {
-      clearTimeout(t);
+    const rec = this._offsetTimers.get(trackId);
+    if (rec) {
+      if (rec.timer) clearTimeout(rec.timer);
       this._offsetTimers.delete(trackId);
     }
-    this.timeline.setOffset(trackId, Number(offset) || 0);
-    this.extractor.bumpTrack(trackId);
+    if (this.timeline.setOffset(trackId, Number(offset) || 0)) {
+      this.extractor.bumpTrack(trackId);
+    }
     this.emit();
     this.refreshStaleFrames();
   }
@@ -198,15 +219,20 @@ export class App {
     const entry = this.files.get(point.trackId);
     if (!track || !entry) return;
 
-    point.frameKey = frameKeyFor(entry.digest.hex, point.sourceTime);
+    // 快照本次取帧的代际/键/源时间：编辑一旦发生，frameGen 推进，
+    // 此后无论缓存回读还是实时提取多晚返回，都不允许把旧帧提交进新分镜。
+    const gen = point.frameGen ?? 0;
+    const key = frameKeyFor(entry.digest, point.sourceTime);
+    const sourceTime = point.sourceTime;
+    point.frameKey = key;
     point.frameStatus = "loading";
     this.emit();
 
     // 1) 先查本地缓存：内容相同（摘要一致）+ 同一源时间才命中
     try {
-      const cached = await this.cache.get(point.frameKey);
-      if (cached && this._isCurrentPoint(point)) {
-        this._adoptFrame(point, cached, true);
+      const cached = await this.cache.get(key);
+      if (cached) {
+        if (this._isCurrentPoint(point, gen)) this._adoptFrame(point, cached, true);
         return;
       }
     } catch {
@@ -217,10 +243,10 @@ export class App {
     const res = await this.extractor.capture(point.id, {
       trackId: point.trackId,
       url: entry.url,
-      sourceTime: point.sourceTime,
+      sourceTime,
     });
 
-    if (res.status === "stale" || !this._isCurrentPoint(point)) return;
+    if (res.status === "stale" || !this._isCurrentPoint(point, gen)) return;
     if (res.status === "error") {
       point.frameStatus = "error";
       this.emit();
@@ -229,12 +255,17 @@ export class App {
     this._adoptFrame(point, res.blob, false);
 
     // 3) 回填缓存；配额失败内部已吞掉
-    this.cache.put(point.frameKey, res.blob).catch(() => {});
+    this.cache.put(key, res.blob).catch(() => {});
   }
 
-  _isCurrentPoint(point) {
+  /** 点仍存活、仍处于本次取帧、且期间没有任何编辑推进过帧代际 */
+  _isCurrentPoint(point, gen) {
     const live = this.timeline.points.find((p) => p.id === point.id);
-    return live === point && live.frameStatus === "loading";
+    return (
+      live === point &&
+      live.frameStatus === "loading" &&
+      (live.frameGen ?? 0) === gen
+    );
   }
 
   _adoptFrame(point, blob, fromCache) {

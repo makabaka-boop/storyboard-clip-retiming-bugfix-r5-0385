@@ -1,6 +1,7 @@
 // 页面渲染层：只处理 DOM/事件；所有规则在 src/ 模块中。
 import { App } from "./app.js";
 import { MAX_POINTS, frameKeyFor } from "./timeline.js";
+import { coverage } from "./clipEdit.js";
 import { FrameExtractor } from "./extractor.js";
 import { formatTime } from "./exports.js";
 import { makeHarness, FakeCanvas } from "../test/fakes.js";
@@ -58,16 +59,16 @@ function renderTracks() {
     card.className = "track-card";
     card.innerHTML = `
       <div class="name">#${i + 1} ${escapeHtml(t.name)}</div>
-      <div class="meta">${formatTime(t.duration)} · ${t.width || "?"}×${t.height || "?"}</div>
+      <div class="meta">源长 ${formatTime(t.duration)} · 覆盖 ${formatTime(coverage(t))}${t.edit?.reverse ? " · 倒放" : ""} · ${t.width || "?"}×${t.height || "?"}</div>
       <div class="digest" title="${t.digest?.algo}:${t.digest?.hex}">${t.digest?.algo}:${(t.digest?.hex ?? "").slice(0, 24)}…</div>
       <div class="row" style="margin-top:8px">
         <span>项目偏移(s)</span>
         <input type="number" min="0" step="0.1" value="${t.offset}" data-role="offset" data-id="${t.id}" />
       </div>
       <div class="row" data-edit="${t.id}">
-        <label>入点<input data-part="in" type="number" value="${t.edit?.in ?? 0}" /></label>
-        <label>出点<input data-part="out" type="number" value="${t.edit?.out ?? t.duration}" /></label>
-        <label>倍速<input data-part="rate" type="number" value="${t.edit?.rate ?? 1}" /></label>
+        <label>入点<input data-part="in" type="number" min="0" step="0.1" value="${t.edit?.in ?? 0}" /></label>
+        <label>出点<input data-part="out" type="number" min="0" step="0.1" value="${t.edit?.out ?? t.duration}" /></label>
+        <label>倍速<input data-part="rate" type="number" min="0.01" step="0.1" value="${t.edit?.rate ?? 1}" /></label>
         <label>反向<input data-part="reverse" type="checkbox" ${t.edit?.reverse ? "checked" : ""} /></label>
         <button data-role="apply-edit" data-id="${t.id}">应用剪辑</button>
       </div>
@@ -75,7 +76,7 @@ function renderTracks() {
         <label class="btn small">替换文件<input type="file" accept="video/*" hidden data-role="replace" data-id="${t.id}" /></label>
         <button class="btn small danger" data-role="remove" data-id="${t.id}">删除轨道</button>
       </div>
-      <div class="meta" style="margin-top:6px">缓存键前缀：${entry ? frameKeyFor(entry.digest.hex, 0).replace(/t0$/, "t{源时间ms}") : ""}</div>
+      <div class="meta" style="margin-top:6px">缓存键前缀：${entry ? frameKeyFor(entry.digest, 0).replace(/t0$/, "t{源时间ms}") : ""}</div>
     `;
     trackList.appendChild(card);
   });
@@ -262,8 +263,10 @@ function renderRuler() {
 
   tracks.forEach((t, i) => {
     const y = top0 + i * (laneH + laneGap);
+    // 覆盖长度遵守当前剪辑参数（入点/出点/倍速），反向不改变长度
+    const cov = coverage(t);
     const x = xOf(t.offset);
-    const w = Math.max(2, xOf(t.offset + t.duration) - x);
+    const w = Math.max(2, xOf(t.offset + cov) - x);
     ctx.fillStyle = TRACK_COLORS[i % TRACK_COLORS.length] + "55";
     ctx.fillRect(x, y, w, laneH);
     ctx.strokeStyle = TRACK_COLORS[i % TRACK_COLORS.length];
